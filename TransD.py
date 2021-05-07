@@ -95,38 +95,154 @@ def traindata_loader(file1,file2,file3,file4):
 
 
 class TransD(nn.Module):
-    def __init__(self,en_num,re_num,en_dim=50,r_dim=50,margin=1,learn_rate=0.01)
+    def __init__(self,en_num,re_num,en_dim=50,r_dim=50,norm=2,margin=1,learn_rate=0.01)
         super(TransR, self).__init__()
         self.entity_num = entity_num
         self.relation_num = relation_num
         self.ent_dim = ent_dim
         self.rel_dim = rel_dim
         self.margin = margin
-        
+        self.norm=norm
         
         self.ent_embedding = torch.nn.Embedding(num_embeddings=self.entity_num,
                                                           embedding_dim=self.ent_dim).cuda()
-        self.ent_projection=torch.nn.Embedding(num_embeddings=self.entity_num, 
+        self.ent_transfer=torch.nn.Embedding(num_embeddings=self.entity_num, 
                                                           embedding_dim=self.ent_dim).cuda()
         
         self.rel_embedding = torch.nn.Embedding(num_embeddings=self.relation_num,
                                                            embedding_dim=self.rel_dim).cuda()
-        self.rel_projection = torch.nn.Embedding(num_embeddings= self.relation_num,
-                                                           embedding_dim=self.ent_dim*self.rel_dim).cuda()
+        self.rel_transfer = torch.nn.Embedding(num_embeddings= self.relation_num,
+                                                           embedding_dim=self.rel_dim).cuda()
         
-        nn.init.xavier_uniform_(self.ent_embeddings.weight.data)
+        self.identity_matrix=torch.eye(ent_dim,rel_dim).cuda()#单位矩阵
+        
+        nn.init.xavier_uniform_(self.ent_embeddings.weight.data)#随机初始化参数
 		nn.init.xavier_uniform_(self.rel_embeddings.weight.data)
 		nn.init.xavier_uniform_(self.ent_transfer.weight.data)
 		nn.init.xavier_uniform_(self.rel_transfer.weight.data)
-  
+        self.loss_F = nn.MarginRankingLoss(self.margin, reduction="mean").cuda()
+        """
         if margin != None:
 			self.margin = nn.Parameter(torch.Tensor([margin]))
 			self.margin.requires_grad = False
 			self.margin_flag = True
 		else:
 			self.margin_flag = False
+        """
+   
+    def _resize(self, tensor, axis, size):
+		shape = tensor.size()
+		osize = shape[axis]
+		if osize == size:
+			return tensor
+		if (osize > size):
+			return torch.narrow(tensor, axis, 0, size)
+		paddings = []
+		for i in range(len(shape)):
+			if i == axis:
+				paddings = [0, size - osize] + paddings
+			else:
+				paddings = [0, 0] + paddings
+		print (paddings)
+		return F.pad(tensor, paddings = paddings, mode = "constant", value = 0)
+
+	def _calc(self, h, t, r):#f(h,r,t)
+		
+  
+  
+        head = self.ent_embedding(h)
+        head_transfer=self.ent_transfer(h)
+        rel = self.rel_embedding(r)
+        rel_transfer = self.rel_transfer(r)
+        tail = self.ent_embedding(t)
+        tail_transfer=self.ent_transfer
+
+        h_=self._transfer(head,head_transfer,rel_transfer)
+        t_=self._transfer(tail,tail_transfer,rel_transfer)
+
+        h = F.normalize(h_, 2, -1)#归一化
+		r = F.normalize(r, 2, -1)
+		t = F.normalize(t_, 2, -1)
+
+		score = h + r - t
+		score = torch.norm(score, self.norm, -1).flatten()#l2范数，然后压扁
+		return score
+    def _transfer(self,ent,ent_transfer,rel_transfer):#从hp，rp转换的h_,r_
+        ent=F.normalize(ent,2,-1)
+        ent_transfer=torch.unsqueeze(ent_transfer,dim=0)
+        rel_transfer=torch.unsqueeze(rel_transfer,dim=1)
         
-        self.loss_F = nn.MarginRankingLoss(self.margin, reduction="mean").cuda()
+        matrix=torch.mm(rel_transfer,ent_transfer)+self.identity_matrix
+        
+        ent=torch.unsqueeze(ent,dim=1)
+        h_=torch.mm(matrix,ent)
+        
+        return torch.squeeze(h_)
+    """      
+	def _transfer(self, e, e_transfer, r_transfer):
+		if e.shape[0] != r_transfer.shape[0]:
+			e = e.view(-1, r_transfer.shape[0], e.shape[-1])
+			e_transfer = e_transfer.view(-1, r_transfer.shape[0], e_transfer.shape[-1])
+			r_transfer = r_transfer.view(-1, r_transfer.shape[0], r_transfer.shape[-1])
+			e = F.normalize(
+				self._resize(e, -1, r_transfer.size()[-1]) + torch.sum(e * e_transfer, -1, True) * r_transfer,
+				p = 2, 
+				dim = -1
+			)			
+			return e.view(-1, e.shape[-1])
+		else:
+			return F.normalize(
+				self._resize(e, -1, r_transfer.size()[-1]) + torch.sum(e * e_transfer, -1, True) * r_transfer,
+				p = 2, 
+				dim = -1
+			)
+    """
+	def forward(self, data):
+		batch_h = data['batch_h']
+		batch_t = data['batch_t']
+		batch_r = data['batch_r']
+		mode = data['mode']
+		h = self.ent_embeddings(batch_h)
+		t = self.ent_embeddings(batch_t)
+		r = self.rel_embeddings(batch_r)
+		h_transfer = self.ent_transfer(batch_h)
+		t_transfer = self.ent_transfer(batch_t)
+		r_transfer = self.rel_transfer(batch_r)
+		h = self._transfer(h, h_transfer, r_transfer)
+		t = self._transfer(t, t_transfer, r_transfer)
+		score = self._calc(h ,t, r, mode)
+		if self.margin_flag:
+			return self.margin - score
+		else:
+			return score
+
+	def regularization(self, data):
+		batch_h = data['batch_h']
+		batch_t = data['batch_t']
+		batch_r = data['batch_r']
+		h = self.ent_embeddings(batch_h)
+		t = self.ent_embeddings(batch_t)
+		r = self.rel_embeddings(batch_r)
+		h_transfer = self.ent_transfer(batch_h)
+		t_transfer = self.ent_transfer(batch_t)
+		r_transfer = self.rel_transfer(batch_r)
+		regul = (torch.mean(h ** 2) + 
+				 torch.mean(t ** 2) + 
+				 torch.mean(r ** 2) + 
+				 torch.mean(h_transfer ** 2) + 
+				 torch.mean(t_transfer ** 2) + 
+				 torch.mean(r_transfer ** 2)) / 6
+		return regul
+
+	def predict(self, data):
+		score = self.forward(data)
+		if self.margin_flag:
+			score = self.margin - score
+			return score.cpu().data.numpy()
+		else:
+			return score.cpu().data.numpy()
+
+        #self.loss_F = nn.MarginRankingLoss(self.margin, reduction="mean").cuda()
 
 class TransD_Train():
     def __init__(self,entity_set,relation_set,train,vaild=None,e_dim=50,r_dim=50,margin=1,learn_rate=0.01,batch_size=200,norm=L2):
